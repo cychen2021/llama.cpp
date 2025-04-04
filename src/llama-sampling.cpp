@@ -2560,3 +2560,156 @@ void llama_perf_sampler_reset(struct llama_sampler * chain) {
 
     ctx->t_sample_us = ctx->n_sample = 0;
 }
+
+// beam search
+
+struct llama_sampler_beam_search {
+    const size_t beam_width;
+    const size_t max_length;
+    const uint32_t seed;
+    uint32_t seed_cur;
+
+    struct beam_sequence {
+        std::vector<llama_token> tokens;
+        float score;
+        bool finished;
+
+        beam_sequence(size_t max_length) : tokens(max_length), score(0.0f), finished(false) {}
+    };
+
+    std::vector<beam_sequence> beams;
+    std::vector<beam_sequence> new_beams;
+    size_t n_beams;
+
+    std::mt19937 rng;
+};
+
+static const char * llama_sampler_beam_search_name(const struct llama_sampler * /*smpl*/) {
+    return "beam_search";
+}
+
+static void llama_sampler_beam_search_free(struct llama_sampler * smpl) {
+    delete (llama_sampler_beam_search *) smpl->ctx;
+}
+
+static void llama_sampler_beam_search_apply(struct llama_sampler * smpl, llama_token_data_array * cur_p) {
+    auto * ctx = (llama_sampler_beam_search *) smpl->ctx;
+
+    // Sort candidates by log probability
+    std::sort(cur_p->data, cur_p->data + cur_p->size,
+              [](const llama_token_data & a, const llama_token_data & b) {
+                  return a.logit > b.logit;
+              });
+
+    // For each current beam
+    ctx->new_beams.clear();
+    
+    // Expand each current beam with top candidates
+    for (size_t i = 0; i < ctx->n_beams; i++) {
+        if (ctx->beams[i].finished) {
+            ctx->new_beams.push_back(ctx->beams[i]);
+            continue;
+        }
+        
+        // Take top beam_width candidates
+        for (size_t j = 0; j < ctx->beam_width && j < cur_p->size; j++) {
+            llama_token token = cur_p->data[j].id;
+            float log_prob = cur_p->data[j].logit;
+            
+            llama_sampler_beam_search::beam_sequence new_beam(ctx->max_length);
+            new_beam.tokens = ctx->beams[i].tokens;
+            new_beam.tokens.push_back(token);
+            new_beam.score = ctx->beams[i].score + log_prob;
+            
+            ctx->new_beams.push_back(std::move(new_beam));
+        }
+    }
+    
+    // Sort new beams by score
+    std::sort(ctx->new_beams.begin(), ctx->new_beams.end(),
+              [](const llama_sampler_beam_search::beam_sequence & a, const llama_sampler_beam_search::beam_sequence & b) {
+                  return a.score > b.score;
+              });
+    
+    // Keep top beam_width beams
+    ctx->beams.clear();
+    ctx->n_beams = 0;
+    for (size_t i = 0; i < ctx->beam_width && i < ctx->new_beams.size(); i++) {
+        ctx->beams.push_back(std::move(ctx->new_beams[i]));
+        ctx->n_beams++;
+    }
+    
+    // Set selected token to the first beam's next token
+    cur_p->selected = 0;
+    for (size_t i = 0; i < cur_p->size; i++) {
+        if (cur_p->data[i].id == ctx->beams[0].tokens.back()) {
+            cur_p->selected = i;
+            break;
+        }
+    }
+}
+
+static void llama_sampler_beam_search_accept(struct llama_sampler * smpl, llama_token token) {
+    auto * ctx = (llama_sampler_beam_search *) smpl->ctx;
+    
+    for (size_t i = 0; i < ctx->n_beams; i++) {
+        if (ctx->beams[i].finished) continue;
+        
+        // Check if sequence is finished
+        if (token == llama_token_eos(NULL) || 
+            ctx->beams[i].tokens.size() >= ctx->max_length) {
+            ctx->beams[i].finished = true;
+        }
+    }
+}
+
+static void llama_sampler_beam_search_reset(struct llama_sampler * smpl) {
+    auto * ctx = (llama_sampler_beam_search *) smpl->ctx;
+    ctx->seed_cur = get_rng_seed(ctx->seed);
+    ctx->rng.seed(ctx->seed_cur);
+    
+    ctx->beams.clear();
+    ctx->beams.push_back(llama_sampler_beam_search::beam_sequence(ctx->max_length));
+    ctx->n_beams = 1;
+}
+
+static struct llama_sampler * llama_sampler_beam_search_clone(const struct llama_sampler * smpl) {
+    const auto * ctx = (const llama_sampler_beam_search *) smpl->ctx;
+    auto * result = llama_sampler_init_beam_search(ctx->beam_width, ctx->max_length, ctx->seed);
+    
+    // Copy the state
+    auto * result_ctx = (llama_sampler_beam_search *) result->ctx;
+    result_ctx->beams = ctx->beams;
+    result_ctx->n_beams = ctx->n_beams;
+    result_ctx->rng = ctx->rng;
+    
+    return result;
+}
+
+static struct llama_sampler_i llama_sampler_beam_search_i = {
+    /* .name   = */ llama_sampler_beam_search_name,
+    /* .accept = */ llama_sampler_beam_search_accept,
+    /* .apply  = */ llama_sampler_beam_search_apply,
+    /* .reset  = */ llama_sampler_beam_search_reset,
+    /* .clone  = */ llama_sampler_beam_search_clone,
+    /* .free   = */ llama_sampler_beam_search_free,
+};
+
+struct llama_sampler * llama_sampler_init_beam_search(size_t beam_width, size_t max_length, uint32_t seed) {
+    auto seed_cur = get_rng_seed(seed);
+    auto * ctx = new llama_sampler_beam_search {
+        /* .beam_width = */ beam_width,
+        /* .max_length = */ max_length,
+        /* .seed       = */ seed,
+        /* .seed_cur   = */ seed_cur,
+        /* .beams      = */ std::vector<llama_sampler_beam_search::beam_sequence>(),
+        /* .new_beams  = */ std::vector<llama_sampler_beam_search::beam_sequence>(),
+        /* .n_beams    = */ 0,
+        /* .rng        = */ std::mt19937(seed_cur),
+    };
+    
+    ctx->beams.push_back(llama_sampler_beam_search::beam_sequence(max_length));
+    ctx->n_beams = 1;
+    
+    return llama_sampler_init(&llama_sampler_beam_search_i, ctx);
+}
